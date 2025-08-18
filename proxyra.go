@@ -1,31 +1,36 @@
 package main
 
 import (
-	"strconv"
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"flag"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"h12.io/socks"
 )
 
 const (
-	readLimitBytes = 64 * 1024 // read up to 64 KB from curl stdout
+	readLimitBytes = 64 * 1024 // read up to 64 KB
 	maxLineBytes   = 1024 * 1024
 )
 
+// read proxies from stdin (pipe mode)
 func readProxiesFromStdin() ([]string, error) {
 	fi, err := os.Stdin.Stat()
 	if err != nil {
 		return nil, err
 	}
-	// if stdin is a terminal, skip
 	if (fi.Mode() & os.ModeCharDevice) != 0 {
 		return nil, nil
 	}
@@ -42,6 +47,7 @@ func readProxiesFromStdin() ([]string, error) {
 	return list, scanner.Err()
 }
 
+// read proxies from file
 func readProxiesFromFile(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -61,6 +67,7 @@ func readProxiesFromFile(path string) ([]string, error) {
 	return list, scanner.Err()
 }
 
+// remove duplicates
 func uniqProxies(proxies []string) []string {
 	seen := make(map[string]struct{}, len(proxies))
 	out := make([]string, 0, len(proxies))
@@ -73,63 +80,121 @@ func uniqProxies(proxies []string) []string {
 	return out
 }
 
+// build transport with full proxy support (http, socks4, socks4a, socks5)
+func newTransport(proxyAddr string, timeout int) (*http.Transport, error) {
+	// accept scheme-less proxy like "1.2.3.4:1080" and default to socks5 as common choice
+	if !strings.Contains(proxyAddr, "://") {
+		proxyAddr = "socks5://" + proxyAddr
+	}
+
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		DisableCompression:  false,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
+	switch u.Scheme {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(u)
+
+	case "socks4", "socks4a", "socks5":
+		// h12.io/socks returns a dial func of signature func(network, addr string) (net.Conn, error)
+		dialSocks := socks.Dial(proxyAddr)
+
+		// Wrap the returned dial function to honor context and avoid leaks.
+		// We also use the caller context deadline, which in your code is set by NewRequestWithContext.
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// If caller already has a deadline, prefer that. Otherwise set an internal timeout.
+			// Use the timeout parameter only as a fallback.
+			dctx := ctx
+			if _, ok := ctx.Deadline(); !ok && timeout > 0 {
+				var cancel context.CancelFunc
+				dctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+				defer cancel()
+			}
+
+			ch := make(chan struct {
+				conn net.Conn
+				err  error
+			}, 1)
+
+			go func() {
+				conn, err := dialSocks(network, addr)
+				// try to send result; if caller already gave up, close the conn to avoid leak
+				select {
+				case ch <- struct {
+					conn net.Conn
+					err  error
+				}{conn, err}:
+					return
+				case <-dctx.Done():
+					if err == nil && conn != nil {
+						_ = conn.Close()
+					}
+					return
+				}
+			}()
+
+			select {
+			case <-dctx.Done():
+				return nil, dctx.Err()
+			case r := <-ch:
+				return r.conn, r.err
+			}
+		}
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
+	}
+
+	return transport, nil
+}
+
+// check if proxy works
 func checkProxy(proxyAddr, target string, timeout int, re *regexp.Regexp) bool {
-	// hard timeout via context
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	// curl options:
-	// -x proxy, --max-time, -s silent, -L follow redirects, -k ignore cert errors
-	cmd := exec.CommandContext(ctx, "curl",
-		"-x", proxyAddr,
-		"--max-time", strconv.Itoa(timeout),
-		"-s",
-		"-L",
-		"-k",
-		target,
-	)
-
-	stdout, err := cmd.StdoutPipe()
+	transport, err := newTransport(proxyAddr, timeout)
 	if err != nil {
 		return false
 	}
 
-	if err := cmd.Start(); err != nil {
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(timeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return nil // follow redirects like -L
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
 		return false
 	}
 
-	// read up to readLimitBytes in a goroutine
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
 	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		// try to copy up to readLimitBytes
-		_, _ = io.CopyN(&buf, stdout, int64(readLimitBytes))
-		close(done)
-	}()
+	_, _ = io.CopyN(&buf, resp.Body, int64(readLimitBytes))
 
-	// wait either for read to finish or context timeout
-	select {
-	case <-done:
-		// read finished because we hit the limit or curl closed stdout
-	case <-ctx.Done():
-		// timeout fired, ensure process is killed
-		_ = cmd.Process.Kill()
-		// wait for goroutine to return
-		<-done
-	}
+	transport.CloseIdleConnections()
 
-	// if buffer reached the limit, kill the process to avoid it blocking on writes
-	if buf.Len() >= readLimitBytes {
-		_ = cmd.Process.Kill()
-	}
-
-	// wait for process to exit; ignore errors and do not print
-	_ = cmd.Wait()
-
-	// apply regex match on what we read
 	return re.Match(buf.Bytes())
 }
 
+// worker
 func worker(jobs <-chan string, target string, timeout int, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for proxyAddr := range jobs {
@@ -145,38 +210,51 @@ func worker(jobs <-chan string, target string, timeout int, re *regexp.Regexp, o
 
 func main() {
 	target := flag.String("url", "", "Target URL (required)")
-	timeout := flag.Int("timeout", 5, "Timeout in seconds (required)")
-	threads := flag.Int("threads", 10, "Number of concurrent threads (required)")
+	timeout := flag.Int("timeout", 5, "Timeout in seconds")
+	threads := flag.Int("threads", 10, "Number of concurrent threads")
 	listFile := flag.String("list", "", "File with list of proxies")
-	regexStr := flag.String("regex", ".*", "Regex to match response (required)")
+	regexStr := flag.String("regex", ".*", "Regex to match response")
 	flag.Parse()
 
-	// silent exit on bad usage or missing values
-	if *target == "" || *timeout <= 0 || *threads <= 0 || *regexStr == "" {
+	if *target == "" {
+		fmt.Fprintln(os.Stderr, "Error: target URL is required")
 		os.Exit(1)
 	}
-
-	// ensure curl exists
-	if _, err := exec.LookPath("curl"); err != nil {
+	if *timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "Error: timeout must be greater than 0")
+		os.Exit(1)
+	}
+	if *threads <= 0 {
+		fmt.Fprintln(os.Stderr, "Error: threads must be greater than 0")
+		os.Exit(1)
+	}
+	if *regexStr == "" {
+		fmt.Fprintln(os.Stderr, "Error: regex cannot be empty")
 		os.Exit(1)
 	}
 
 	re, err := regexp.Compile(*regexStr)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: invalid regex:", err)
 		os.Exit(1)
 	}
 
 	proxies, err := readProxiesFromStdin()
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading proxies from stdin:", err)
 		os.Exit(1)
 	}
+
 	if len(proxies) == 0 && *listFile != "" {
 		proxies, err = readProxiesFromFile(*listFile)
 		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading proxies from file:", err)
 			os.Exit(1)
 		}
 	}
+
 	if len(proxies) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: no proxies provided")
 		os.Exit(1)
 	}
 
@@ -205,7 +283,6 @@ func main() {
 		close(out)
 	}()
 
-	// print only working proxies, nothing else
 	for ok := range out {
 		_, _ = os.Stdout.WriteString(ok + "\n")
 	}

@@ -1,11 +1,10 @@
-# Proxyra
-Proxyra — Fast, minimal, reliable proxy checker.
+# proxyra
+proxyra — Fast, minimal, reliable proxy checker.
 
 ## Features
 - Minimal memory usage (reads only up to 64KB per response)
 - Removes duplicate proxies automatically
 - Regex matching for response content
-- Uses `curl` under the hood
 - Ignores SSL certificate errors
 - Supports all common proxy types: HTTP, HTTPS, SOCKS4, SOCKS5
 
@@ -22,7 +21,7 @@ Proxyra — Fast, minimal, reliable proxy checker.
 ## Installation
 
 ```bash
-go install github.com/pzaeemfar/proxyra@latest
+GOPROXY=direct go install github.com/pzaeemfar/proxyra@latest
 ````
 
 ## Usage Examples
