@@ -1,4 +1,4 @@
-module github.com/pzaeemfar/proxyra
+module github.com/ogpourya/proxyra
 
 go 1.24.5
 

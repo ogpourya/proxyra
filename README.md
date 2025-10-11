@@ -21,7 +21,7 @@ proxyra — Fast, minimal, reliable proxy checker.
 ## Installation
 
 ```bash
-GOPROXY=direct go install github.com/pzaeemfar/proxyra@latest
+GOPROXY=direct go install github.com/ogpourya/proxyra@latest
 ````
 
 ## Usage Examples
