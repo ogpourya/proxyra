@@ -4,38 +4,39 @@ proxyra — Fast, minimal, reliable proxy checker.
 ## Features
 - Minimal memory usage (reads only up to 64KB per response)
 - Removes duplicate proxies automatically
-- Regex matching for response content
+- Regex matching for full response (Headers + Body)
 - Ignores SSL certificate errors
 - Supports all common proxy types: HTTP, HTTPS, SOCKS4, SOCKS5
+- Supports fractional timeouts (e.g., 0.5s)
 
 ## Options
 
-| Option     | Description                         | Required |
-|------------|-------------------------------------|----------|
-| `-url`     | Target URL to check                  | Yes      |
-| `-timeout` | Timeout in seconds                   | Yes      |
-| `-threads` | Number of concurrent threads        | Yes      |
-| `-list`    | File containing list of proxies     | No       |
-| `-regex`   | Regex to match response content     | Yes      |
+| Option | Description                                      | Required |
+|--------|--------------------------------------------------|----------|
+| `-u`   | Target URL to check                              | Yes      |
+| `-t`   | Timeout in seconds (e.g. 5 or 0.5)               | Yes      |
+| `-c`   | Concurrency (number of threads)                  | Yes      |
+| `-l`   | File containing list of proxies                  | No       |
+| `-r`   | Regex to match response (Headers or Body)        | Yes      |
 
 ## Installation
 
 ```bash
 GOPROXY=direct go install github.com/ogpourya/proxyra@latest
-````
+```
 
 ## Usage Examples
 
 Pipe a list of proxies:
 
 ```bash
-cat proxies.txt | proxyra -url https://example.com -timeout 5 -threads 20 -regex "Example Domain"
+cat proxies.txt | proxyra -u https://example.com -t 5 -c 20 -r "Example Domain"
 ```
 
 Use a file directly:
 
 ```bash
-proxyra -url https://example.com -timeout 5 -threads 20 -list proxies.txt -regex "Example Domain"
+proxyra -u https://example.com -t 5 -c 20 -l proxies.txt -r "Example Domain"
 ```
 
 ## License
