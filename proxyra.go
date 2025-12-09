@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
@@ -81,7 +82,7 @@ func uniqProxies(proxies []string) []string {
 }
 
 // build transport with full proxy support (http, socks4, socks4a, socks5)
-func newTransport(proxyAddr string, timeout int) (*http.Transport, error) {
+func newTransport(proxyAddr string, timeout float64) (*http.Transport, error) {
 	// accept scheme-less proxy like "1.2.3.4:1080" and default to socks5 as common choice
 	if !strings.Contains(proxyAddr, "://") {
 		proxyAddr = "socks5://" + proxyAddr
@@ -116,7 +117,7 @@ func newTransport(proxyAddr string, timeout int) (*http.Transport, error) {
 			dctx := ctx
 			if _, ok := ctx.Deadline(); !ok && timeout > 0 {
 				var cancel context.CancelFunc
-				dctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+				dctx, cancel = context.WithTimeout(ctx, time.Duration(timeout*float64(time.Second)))
 				defer cancel()
 			}
 
@@ -132,7 +133,10 @@ func newTransport(proxyAddr string, timeout int) (*http.Transport, error) {
 				case ch <- struct {
 					conn net.Conn
 					err  error
-				}{conn, err}:
+				}{
+					conn: conn,
+					err:  err,
+				}:
 					return
 				case <-dctx.Done():
 					if err == nil && conn != nil {
@@ -158,8 +162,9 @@ func newTransport(proxyAddr string, timeout int) (*http.Transport, error) {
 }
 
 // check if proxy works
-func checkProxy(proxyAddr, target string, timeout int, re *regexp.Regexp) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func checkProxy(proxyAddr, target string, timeout float64, re *regexp.Regexp) bool {
+	timeoutDuration := time.Duration(timeout * float64(time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
 
 	transport, err := newTransport(proxyAddr, timeout)
@@ -169,7 +174,7 @@ func checkProxy(proxyAddr, target string, timeout int, re *regexp.Regexp) bool {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   time.Duration(timeout) * time.Second,
+		Timeout:   timeoutDuration,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return nil // follow redirects like -L
 		},
@@ -186,7 +191,15 @@ func checkProxy(proxyAddr, target string, timeout int, re *regexp.Regexp) bool {
 	}
 	defer resp.Body.Close()
 
+	// Dump headers (false = do not dump body yet)
+	headerDump, err := httputil.DumpResponse(resp, false)
+	if err != nil {
+		// fallback if dump fails, though unlikely
+		headerDump = []byte{}
+	}
+
 	var buf bytes.Buffer
+	buf.Write(headerDump)
 	_, _ = io.CopyN(&buf, resp.Body, int64(readLimitBytes))
 
 	transport.CloseIdleConnections()
@@ -195,7 +208,7 @@ func checkProxy(proxyAddr, target string, timeout int, re *regexp.Regexp) bool {
 }
 
 // worker
-func worker(jobs <-chan string, target string, timeout int, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup) {
+func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for proxyAddr := range jobs {
 		proxyAddr = strings.TrimSpace(proxyAddr)
@@ -209,15 +222,16 @@ func worker(jobs <-chan string, target string, timeout int, re *regexp.Regexp, o
 }
 
 func main() {
-	target := flag.String("url", "", "Target URL (required)")
-	timeout := flag.Int("timeout", 5, "Timeout in seconds")
-	threads := flag.Int("threads", 10, "Number of concurrent threads")
-	listFile := flag.String("list", "", "File with list of proxies")
-	regexStr := flag.String("regex", ".*", "Regex to match response")
+	target := flag.String("u", "", "Target URL (required)")
+	timeout := flag.Float64("t", 5.0, "Timeout in seconds (float, e.g. 1.5)")
+	threads := flag.Int("c", 10, "Concurrency (number of threads)")
+	listFile := flag.String("l", "", "File with list of proxies")
+	regexStr := flag.String("r", ".*", "Regex to match response (headers or body)")
 	flag.Parse()
 
 	if *target == "" {
 		fmt.Fprintln(os.Stderr, "Error: target URL is required")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 	if *timeout <= 0 {
