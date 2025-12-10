@@ -11,13 +11,13 @@ proxyra — Fast, minimal, reliable proxy checker.
 
 ## Options
 
-| Option | Description                                      | Required |
-|--------|--------------------------------------------------|----------|
-| `-u`   | Target URL to check                              | Yes      |
-| `-t`   | Timeout in seconds (e.g. 5 or 0.5)               | Yes      |
-| `-c`   | Concurrency (number of threads)                  | Yes      |
-| `-l`   | File containing list of proxies                  | No       |
-| `-r`   | Regex to match response (Headers or Body)        | Yes      |
+| Option | Description                               |
+| ------ | ----------------------------------------- |
+| `-u`   | Target URL to check                       |
+| `-t`   | Timeout in seconds (e.g. 5 or 0.5)        |
+| `-c`   | Concurrency (number of threads)           |
+| `-l`   | File containing list of proxies           |
+| `-r`   | Regex to match response (Headers or Body) |
 
 ## Installation
 
