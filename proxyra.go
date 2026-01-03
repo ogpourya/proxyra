@@ -118,10 +118,9 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 			// If caller already has a deadline, prefer that. Otherwise set an internal timeout.
 			// Use the timeout parameter only as a fallback.
 			dctx := ctx
+			var cancel context.CancelFunc
 			if _, ok := ctx.Deadline(); !ok && timeout > 0 {
-				var cancel context.CancelFunc
 				dctx, cancel = context.WithTimeout(ctx, time.Duration(timeout*float64(time.Second)))
-				defer cancel()
 			}
 
 			ch := make(chan struct {
@@ -151,8 +150,14 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 
 			select {
 			case <-dctx.Done():
+				if cancel != nil {
+					cancel()
+				}
 				return nil, dctx.Err()
 			case r := <-ch:
+				if cancel != nil {
+					cancel()
+				}
 				return r.conn, r.err
 			}
 		}
@@ -237,7 +242,7 @@ func checkProxyTCP(proxyAddr, target string, timeout float64) bool {
 
 		// Parse HTTP status line properly
 		parts := strings.Fields(line)
-		if len(parts) < 2 || parts[1] != "200" {
+		if len(parts) < 2 || (parts[1] != "200" && !strings.HasPrefix(parts[1], "2")) {
 			proxyConn.Close()
 			return false
 		}
@@ -351,19 +356,23 @@ func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Rege
 		return false
 	}
 
+	// Read body up to limit
+	var buf bytes.Buffer
+	_, _ = io.CopyN(&buf, resp.Body, int64(readLimitBytes))
+
 	// Dump headers (false = do not dump body yet)
 	headerDump, err := httputil.DumpResponse(resp, false)
 	if err != nil {
 		headerDump = []byte{}
 	}
 
-	var buf bytes.Buffer
-	buf.Write(headerDump)
-	_, _ = io.CopyN(&buf, resp.Body, int64(readLimitBytes))
+	var fullResponse bytes.Buffer
+	fullResponse.Write(headerDump)
+	fullResponse.Write(buf.Bytes())
 
 	transport.CloseIdleConnections()
 
-	return re.Match(buf.Bytes())
+	return re.Match(fullResponse.Bytes())
 }
 
 // worker
