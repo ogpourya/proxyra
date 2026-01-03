@@ -36,7 +36,7 @@ This multi-source fallback ensures reliability even if one or more IP services a
 ## Installation
 
 ```bash
-GOPROXY=direct go install github.com/ogpourya/proxyra@latest
+go install github.com/ogpourya/proxyra@latest
 ```
 
 ## Usage Examples
