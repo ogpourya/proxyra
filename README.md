@@ -11,6 +11,12 @@ proxyra — Fast, minimal, reliable proxy checker.
 - TCP connection mode support
 - Option to ignore SSL certificate errors
 
+## Automatic Fallback (Smart Mode)
+
+If you don't provide a target URL (`-u`) or a regex (`-r`), **proxyra** automatically switches to an IP-matching mechanism. It sequentially tries multiple reliable IP services (`icanhazip.com`, `checkip.amazonaws.com`, and `a.ident.me`) to verify that your proxy is truly anonymous and functional.
+
+This multi-source fallback ensures reliability even if one or more IP services are down or blocking requests.
+
 ## Options
 
 | Option | Description                               |
@@ -20,7 +26,7 @@ proxyra — Fast, minimal, reliable proxy checker.
 | `-c`   | Concurrency (number of threads)           |
 | `-l`   | File containing list of proxies           |
 | `-r`   | Regex to match response (Headers or Body) |
-| `-k`   | Allow insecure TLS connections            |
+| `-k`   | Allow insecure TLS connections (default: false) |
 | `-n`   | Number of times a proxy must pass checks  |
 | `-m`   | Stop after finding N valid proxies        |
 | `-s`   | Expected HTTP status code                 |

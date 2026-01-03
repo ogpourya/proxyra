@@ -269,6 +269,40 @@ func checkProxyTCP(proxyAddr, target string, timeout float64) bool {
 
 // check if proxy works with HTTP mode
 func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
+	// If target is "SMART_MODE", we try multiple IP services sequentially
+	if target == "SMART_MODE" {
+		services := []string{
+			"http://icanhazip.com",
+			"https://checkip.amazonaws.com",
+			"https://a.ident.me",
+		}
+
+		// Determine expected IP once
+		host := proxyAddr
+		if strings.Contains(host, "://") {
+			u, _ := url.Parse(host)
+			if u != nil {
+				host = u.Host
+			}
+		}
+		ip, _, err := net.SplitHostPort(host)
+		if err != nil {
+			ip = host
+		}
+		ipRe, _ := regexp.Compile(regexp.QuoteMeta(strings.TrimSpace(ip)))
+
+		for _, svc := range services {
+			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, expectedStatus, headers, stderrMutex) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return performHTTPCheck(proxyAddr, target, timeout, re, insecure, expectedStatus, headers, stderrMutex)
+}
+
+func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
 	timeoutDuration := time.Duration(timeout * float64(time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
@@ -320,7 +354,6 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 	// Dump headers (false = do not dump body yet)
 	headerDump, err := httputil.DumpResponse(resp, false)
 	if err != nil {
-		// fallback if dump fails, though unlikely
 		headerDump = []byte{}
 	}
 
@@ -395,12 +428,12 @@ func (h *headerFlags) Set(value string) error {
 }
 
 func main() {
-	target := flag.String("u", "", "Target URL or address (required)")
+	target := flag.String("u", "", "Target URL or address (required if -tcp is used)")
 	timeout := flag.Float64("t", 5.0, "Timeout in seconds (float, e.g. 1.5)")
 	threads := flag.Int("c", 10, "Concurrency (number of threads)")
 	listFile := flag.String("l", "", "File with list of proxies")
-	regexStr := flag.String("r", ".*", "Regex to match response (headers or body)")
-	insecure := flag.Bool("k", false, "Allow insecure TLS connections")
+	regexStr := flag.String("r", "", "Regex to match response (headers or body)")
+	insecure := flag.Bool("k", false, "Allow insecure TLS connections (disabled by default)")
 	checkCount := flag.Int("n", 1, "Number of times a proxy must pass checks to be valid")
 	tcpMode := flag.Bool("tcp", false, "TCP connection mode (test raw TCP connection instead of HTTP)")
 	maxFound := flag.Int("m", 0, "Stop after finding N valid proxies (0 = unlimited)")
@@ -409,8 +442,12 @@ func main() {
 	flag.Var(&headers, "H", "Custom request header (can be used multiple times, e.g. -H \"User-Agent: custom\")")
 	flag.Parse()
 
-	if *target == "" {
-		fmt.Fprintln(os.Stderr, "Error: target URL or address is required")
+	if *target == "" && !*tcpMode {
+		*target = "SMART_MODE"
+	}
+
+	if *target == "" && *tcpMode {
+		fmt.Fprintln(os.Stderr, "Error: target URL or address is required when using -tcp")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -440,16 +477,22 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error: TCP mode requires target in host:port format")
 			os.Exit(1)
 		}
-	} else {
+	} else if *target != "SMART_MODE" {
 		// HTTP mode: validate URL format
 		if !strings.HasPrefix(*target, "http://") && !strings.HasPrefix(*target, "https://") {
 			fmt.Fprintln(os.Stderr, "Error: HTTP mode requires target URL starting with http:// or https://")
 			os.Exit(1)
 		}
 	}
+
+	// For the fallback mechanism, regex is the proxy's IP.
+	// We handle this inside the worker or by compiling a placeholder here.
 	if *regexStr == "" {
-		fmt.Fprintln(os.Stderr, "Error: regex cannot be empty")
-		os.Exit(1)
+		if *target == "SMART_MODE" {
+			*regexStr = ".*" // Placeholder, logic handled in checkProxyHTTP
+		} else {
+			*regexStr = ".*"
+		}
 	}
 
 	re, err := regexp.Compile(*regexStr)
