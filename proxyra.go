@@ -99,8 +99,10 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 			MinVersion:         tls.VersionTLS12,
 		},
 		DisableCompression:  false,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        0,
+		IdleConnTimeout:     0,
+		MaxIdleConnsPerHost: -1,
+		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
