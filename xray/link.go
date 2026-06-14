@@ -1,0 +1,649 @@
+package xray
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+type XrayOutbound struct {
+	Protocol       string         `json:"protocol"`
+	Tag            string         `json:"tag,omitempty"`
+	Settings       map[string]any `json:"settings"`
+	StreamSettings map[string]any `json:"streamSettings,omitempty"`
+	Mux            map[string]any `json:"mux,omitempty"`
+}
+
+func ParseLink(link string) (*XrayOutbound, error) {
+	link = strings.TrimSpace(link)
+	switch {
+	case strings.HasPrefix(link, "vmess://"):
+		return parseVmess(link)
+	case strings.HasPrefix(link, "vless://"):
+		return parseVless(link)
+	case strings.HasPrefix(link, "trojan://"):
+		return parseTrojan(link)
+	case strings.HasPrefix(link, "ss://"):
+		return parseShadowsocks(link)
+	case strings.HasPrefix(link, "hysteria2://"), strings.HasPrefix(link, "hy2://"):
+		return parseHysteria2(link)
+	case strings.HasPrefix(link, "wireguard://"), strings.HasPrefix(link, "wg://"):
+		return parseWireguard(link)
+	default:
+		return nil, fmt.Errorf("unsupported link scheme")
+	}
+}
+
+func parseVmess(link string) (*XrayOutbound, error) {
+	b64 := strings.TrimPrefix(link, "vmess://")
+	raw, err := base64.StdEncoding.DecodeString(padBase64(b64))
+	if err != nil {
+		raw, err = base64.RawURLEncoding.DecodeString(b64)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("vmess decode: %w", err)
+	}
+	var j map[string]any
+	if err := json.Unmarshal(raw, &j); err != nil {
+		return nil, fmt.Errorf("vmess json: %w", err)
+	}
+
+	network := getString(j, "net", "tcp")
+	security := "none"
+	if tls, _ := j["tls"].(string); tls == "tls" {
+		security = "tls"
+	}
+	stream := buildStream(network, security)
+
+	switch network {
+	case "ws":
+		if host, ok := j["host"].(string); ok {
+			setWS(stream, host, getString(j, "path", "/"))
+		}
+	case "grpc":
+		svc := getString(j, "path", "")
+		if auth, ok := j["authority"].(string); ok && auth != "" {
+			(stream["grpcSettings"].(map[string]any))["authority"] = auth
+		}
+		(stream["grpcSettings"].(map[string]any))["serviceName"] = svc
+		(stream["grpcSettings"].(map[string]any))["multiMode"] = getString(j, "type", "") == "multi"
+	case "httpupgrade":
+		setHTTPUpgrade(stream, getString(j, "host", ""), getString(j, "path", "/"))
+	case "xhttp":
+		xh := stream["xhttpSettings"].(map[string]any)
+		xh["host"] = getString(j, "host", "")
+		xh["path"] = getString(j, "path", "/")
+		if m := getString(j, "mode", ""); m != "" {
+			xh["mode"] = m
+		}
+		for _, k := range []string{"xPaddingBytes", "scMaxEachPostBytes", "scMinPostsIntervalMs"} {
+			if v, ok := j[k]; ok {
+				xh[k] = v
+			}
+		}
+	case "tcp":
+		if getString(j, "type", "") == "http" {
+			stream["tcpSettings"] = map[string]any{
+				"header": map[string]any{
+					"type": "http",
+					"request": map[string]any{
+						"version": "1.1",
+						"method":  "GET",
+						"path":    splitComma(getString(j, "path", "/")),
+						"headers": map[string]any{"Host": splitComma(getString(j, "host", ""))},
+					},
+				},
+			}
+		}
+	}
+
+	if security == "tls" {
+		tls := stream["tlsSettings"].(map[string]any)
+		tls["serverName"] = getString(j, "sni", "")
+		tls["fingerprint"] = getString(j, "fp", "")
+		if alpn := getString(j, "alpn", ""); alpn != "" {
+			tls["alpn"] = splitComma(alpn)
+		}
+		for _, k := range []string{"insecure", "allowInsecure"} {
+			if v, ok := j[k]; ok {
+				switch x := v.(type) {
+				case bool:
+					tls[k] = x
+				case string:
+					tls[k] = x == "1" || x == "true"
+				}
+			}
+		}
+	}
+
+	port := num(j["port"])
+	ob := &XrayOutbound{
+		Protocol: "vmess",
+		Tag:      getString(j, "ps", ""),
+		Settings: map[string]any{
+			"vnext": []any{
+				map[string]any{
+					"address": getString(j, "add", ""),
+					"port":    port,
+					"users": []any{
+						map[string]any{
+							"id":       getString(j, "id", ""),
+							"security": getString(j, "scy", "auto"),
+						},
+					},
+				},
+			},
+		},
+		StreamSettings: stream,
+	}
+	return ob, nil
+}
+
+func parseVless(link string) (*XrayOutbound, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "vless" {
+		return nil, fmt.Errorf("not vless")
+	}
+	if u.User == nil {
+		return nil, fmt.Errorf("missing user id in vless link")
+	}
+	id := u.User.Username()
+	host := u.Hostname()
+	port := defaultPort(u.Port(), 443)
+	params := u.Query()
+	network := params.Get("type")
+	if network == "" {
+		network = "tcp"
+	}
+	security := params.Get("security")
+	if security == "" {
+		security = "none"
+	}
+	stream := buildStream(network, security)
+	applyTransport(stream, params)
+	applySecurity(stream, params)
+	applyFinalMask(stream, params)
+
+	ob := &XrayOutbound{
+		Protocol: "vless",
+		Tag:      decodeHash(u.Fragment),
+		Settings: map[string]any{
+			"address":    host,
+			"port":       port,
+			"id":         id,
+			"flow":       params.Get("flow"),
+			"encryption": firstNonEmpty(params.Get("encryption"), "none"),
+		},
+		StreamSettings: stream,
+	}
+	return ob, nil
+}
+
+func parseTrojan(link string) (*XrayOutbound, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "trojan" {
+		return nil, fmt.Errorf("not trojan")
+	}
+	if u.User == nil {
+		return nil, fmt.Errorf("missing password in trojan link")
+	}
+	pw := u.User.Username()
+	host := u.Hostname()
+	port := defaultPort(u.Port(), 443)
+	params := u.Query()
+	network := params.Get("type")
+	if network == "" {
+		network = "tcp"
+	}
+	security := params.Get("security")
+	if security == "" {
+		security = "tls"
+	}
+	stream := buildStream(network, security)
+	applyTransport(stream, params)
+	applySecurity(stream, params)
+	applyFinalMask(stream, params)
+
+	ob := &XrayOutbound{
+		Protocol: "trojan",
+		Tag:      decodeHash(u.Fragment),
+		Settings: map[string]any{
+			"servers": []any{
+				map[string]any{"address": host, "port": port, "password": pw},
+			},
+		},
+		StreamSettings: stream,
+	}
+	return ob, nil
+}
+
+func parseShadowsocks(link string) (*XrayOutbound, error) {
+	remark := ""
+	if i := strings.Index(link, "#"); i >= 0 {
+		remark, _ = url.QueryUnescape(link[i+1:])
+		link = link[:i]
+	}
+	core := strings.TrimPrefix(link, "ss://")
+	at := strings.Index(core, "@")
+	if at >= 0 {
+		userB64 := core[:at]
+		hp := core[at+1:]
+		userInfo, err := base64DecodeFlexible(userB64)
+		if err != nil {
+			userInfo = userB64
+		}
+		colon := strings.LastIndex(hp, ":")
+		if colon < 0 {
+			return nil, fmt.Errorf("bad ss host:port")
+		}
+		host := hp[:colon]
+		port, _ := strconv.Atoi(hp[colon+1:])
+		method, pass := splitMethodPass(userInfo)
+		ob := &XrayOutbound{
+			Protocol: "shadowsocks",
+			Tag:      remark,
+			Settings: map[string]any{
+				"servers": []any{
+					map[string]any{"address": host, "port": port, "password": pass, "method": method},
+				},
+			},
+		}
+		return ob, nil
+	}
+	dec, err := base64DecodeFlexible(core)
+	if err != nil {
+		return nil, err
+	}
+	at = strings.Index(dec, "@")
+	if at < 0 {
+		return nil, fmt.Errorf("bad legacy ss")
+	}
+	userInfo := dec[:at]
+	hp := dec[at+1:]
+	colon := strings.LastIndex(hp, ":")
+	if colon < 0 {
+		return nil, fmt.Errorf("bad legacy ss hp")
+	}
+	host := hp[:colon]
+	port, _ := strconv.Atoi(hp[colon+1:])
+	method, pass := splitMethodPass(userInfo)
+	ob := &XrayOutbound{
+		Protocol: "shadowsocks",
+		Tag:      remark,
+		Settings: map[string]any{
+			"servers": []any{
+				map[string]any{"address": host, "port": port, "password": pass, "method": method},
+			},
+		},
+	}
+	return ob, nil
+}
+
+func parseHysteria2(link string) (*XrayOutbound, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "hysteria2" && u.Scheme != "hy2" {
+		return nil, fmt.Errorf("not hysteria2")
+	}
+	if u.User == nil {
+		return nil, fmt.Errorf("missing auth in hysteria2 link")
+	}
+	auth := u.User.Username()
+	host := u.Hostname()
+	port := defaultPort(u.Port(), 443)
+	params := u.Query()
+
+	stream := map[string]any{
+		"network":  "hysteria",
+		"security": "tls",
+		"hysteriaSettings": map[string]any{
+			"version":        2,
+			"auth":           auth,
+			"udpIdleTimeout": 60,
+		},
+		"tlsSettings": map[string]any{
+			"serverName":           params.Get("sni"),
+			"alpn":                 splitCommaOrDefault(params.Get("alpn"), []string{"h3"}),
+			"fingerprint":          params.Get("fp"),
+			"echConfigList":        params.Get("ech"),
+			"verifyPeerCertByName": "",
+			"pinnedPeerCertSha256": params.Get("pinSHA256"),
+		},
+	}
+	applyFinalMask(stream, params)
+
+	ob := &XrayOutbound{
+		Protocol:       "hysteria",
+		Tag:            decodeHash(u.Fragment),
+		Settings:       map[string]any{"address": host, "port": port, "version": 2},
+		StreamSettings: stream,
+	}
+	return ob, nil
+}
+
+func parseWireguard(link string) (*XrayOutbound, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "wireguard" && u.Scheme != "wg" {
+		return nil, fmt.Errorf("not wireguard")
+	}
+	if u.User == nil {
+		return nil, fmt.Errorf("missing secret key in wireguard link")
+	}
+	secret, _ := url.QueryUnescape(u.User.Username())
+	params := u.Query()
+	host := u.Hostname()
+	portStr := u.Port()
+	endpoint := host
+	if portStr != "" {
+		endpoint = host + ":" + portStr
+	}
+
+	addrRaw := firstParam(params, "address", "ip")
+	allowedRaw := firstParam(params, "allowedips", "allowed_ips")
+	addrs := splitComma(addrRaw)
+	if len(addrs) == 0 {
+		addrs = []string{"0.0.0.0/0", "::/0"}
+	}
+	allowed := splitComma(allowedRaw)
+	if len(allowed) == 0 {
+		allowed = []string{"0.0.0.0/0", "::/0"}
+	}
+
+	peer := map[string]any{
+		"publicKey":  firstParam(params, "publickey", "publicKey", "public_key", "peerPublicKey"),
+		"endpoint":   endpoint,
+		"allowedIPs": allowed,
+	}
+	if psk := firstParam(params, "presharedkey", "preshared_key", "pre-shared-key", "psk"); psk != "" {
+		peer["preSharedKey"] = psk
+	}
+	if ka := firstParam(params, "keepalive", "persistentkeepalive", "persistent_keepalive"); ka != "" {
+		if n, err := strconv.Atoi(ka); err == nil {
+			peer["keepAlive"] = n
+		}
+	}
+
+	settings := map[string]any{
+		"secretKey": secret,
+		"address":   addrs,
+		"peers":     []any{peer},
+	}
+	if mtu := params.Get("mtu"); mtu != "" {
+		if n, err := strconv.Atoi(mtu); err == nil {
+			settings["mtu"] = n
+		}
+	}
+	if res := params.Get("reserved"); res != "" {
+		parts := splitComma(res)
+		var iv []int
+		for _, p := range parts {
+			if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+				iv = append(iv, n)
+			}
+		}
+		if len(iv) > 0 {
+			settings["reserved"] = iv
+		}
+	}
+
+	ob := &XrayOutbound{
+		Protocol: "wireguard",
+		Tag:      decodeHash(u.Fragment),
+		Settings: settings,
+	}
+	return ob, nil
+}
+
+func buildStream(network, security string) map[string]any {
+	stream := map[string]any{"network": network, "security": security}
+	switch network {
+	case "tcp":
+		stream["tcpSettings"] = map[string]any{"header": map[string]any{"type": "none"}}
+	case "kcp":
+		stream["kcpSettings"] = map[string]any{
+			"mtu": 1350, "tti": 20, "uplinkCapacity": 5, "downlinkCapacity": 20,
+			"cwndMultiplier": 1, "maxSendingWindow": 2097152,
+		}
+	case "ws":
+		stream["wsSettings"] = map[string]any{"path": "/", "host": "", "headers": map[string]any{}, "heartbeatPeriod": 0}
+	case "grpc":
+		stream["grpcSettings"] = map[string]any{"serviceName": "", "authority": "", "multiMode": false}
+	case "httpupgrade":
+		stream["httpupgradeSettings"] = map[string]any{"path": "/", "host": "", "headers": map[string]any{}}
+	case "xhttp":
+		stream["xhttpSettings"] = map[string]any{
+			"path": "/", "host": "", "mode": "auto", "headers": map[string]any{},
+			"xPaddingBytes": "100-1000",
+		}
+	default:
+		stream["tcpSettings"] = map[string]any{"header": map[string]any{"type": "none"}}
+	}
+	switch security {
+	case "tls":
+		stream["tlsSettings"] = map[string]any{
+			"serverName": "", "alpn": []any{}, "fingerprint": "",
+			"echConfigList": "", "verifyPeerCertByName": "", "pinnedPeerCertSha256": "",
+		}
+	case "reality":
+		stream["realitySettings"] = map[string]any{
+			"publicKey": "", "fingerprint": "chrome", "serverName": "",
+			"shortId": "", "spiderX": "", "mldsa65Verify": "",
+		}
+	}
+	return stream
+}
+
+func setWS(stream map[string]any, host, path string) {
+	ws := stream["wsSettings"].(map[string]any)
+	ws["host"] = host
+	ws["path"] = path
+}
+
+func setHTTPUpgrade(stream map[string]any, host, path string) {
+	h := stream["httpupgradeSettings"].(map[string]any)
+	h["host"] = host
+	h["path"] = path
+}
+
+func applyTransport(stream map[string]any, p url.Values) {
+	net := stream["network"].(string)
+	host := p.Get("host")
+	path := firstNonEmpty(p.Get("path"), "/")
+	switch net {
+	case "ws":
+		setWS(stream, host, path)
+	case "grpc":
+		gs := stream["grpcSettings"].(map[string]any)
+		gs["serviceName"] = firstNonEmpty(p.Get("serviceName"), p.Get("path"))
+		gs["authority"] = p.Get("authority")
+		gs["multiMode"] = p.Get("mode") == "multi"
+	case "httpupgrade":
+		setHTTPUpgrade(stream, host, path)
+	case "xhttp":
+		xh := stream["xhttpSettings"].(map[string]any)
+		xh["host"] = host
+		xh["path"] = path
+		if m := p.Get("mode"); m != "" {
+			xh["mode"] = m
+		}
+		for _, k := range []string{"xPaddingBytes", "scMaxEachPostBytes", "scMinPostsIntervalMs", "uplinkChunkSize"} {
+			if v := p.Get(k); v != "" {
+				xh[k] = v
+			}
+		}
+	case "tcp":
+		if p.Get("headerType") == "http" || p.Get("type") == "http" {
+			stream["tcpSettings"] = map[string]any{
+				"header": map[string]any{
+					"type": "http",
+					"request": map[string]any{
+						"version": "1.1",
+						"method":  "GET",
+						"path":    splitComma(path),
+						"headers": map[string]any{"Host": splitComma(host)},
+					},
+				},
+			}
+		}
+	}
+}
+
+func applySecurity(stream map[string]any, p url.Values) {
+	sec := stream["security"].(string)
+	switch sec {
+	case "tls":
+		tls := stream["tlsSettings"].(map[string]any)
+		tls["serverName"] = p.Get("sni")
+		tls["fingerprint"] = p.Get("fp")
+		if alpn := p.Get("alpn"); alpn != "" {
+			tls["alpn"] = splitComma(alpn)
+		}
+		tls["echConfigList"] = p.Get("ech")
+		tls["pinnedPeerCertSha256"] = p.Get("pcs")
+		for _, k := range []string{"insecure", "allowInsecure"} {
+			if v := p.Get(k); v != "" {
+				tls[k] = v == "1" || v == "true"
+			}
+		}
+	case "reality":
+		re := stream["realitySettings"].(map[string]any)
+		re["serverName"] = p.Get("sni")
+		re["fingerprint"] = firstNonEmpty(p.Get("fp"), "chrome")
+		re["publicKey"] = p.Get("pbk")
+		re["shortId"] = p.Get("sid")
+		re["spiderX"] = p.Get("spx")
+		re["mldsa65Verify"] = p.Get("pqv")
+	}
+}
+
+func applyFinalMask(stream map[string]any, p url.Values) {
+	if fm := p.Get("fm"); fm != "" {
+		var parsed any
+		if json.Unmarshal([]byte(fm), &parsed) == nil {
+			stream["finalmask"] = parsed
+		}
+	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func firstParam(p url.Values, keys ...string) string {
+	for _, k := range keys {
+		if v := p.Get(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func decodeHash(h string) string {
+	if h == "" {
+		return ""
+	}
+	if dec, err := url.QueryUnescape(h); err == nil {
+		return dec
+	}
+	return h
+}
+
+func defaultPort(p string, def int) int {
+	if p == "" {
+		return def
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func num(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	case int64:
+		return int(x)
+	case string:
+		n, _ := strconv.Atoi(x)
+		return n
+	}
+	return 0
+}
+
+func getString(m map[string]any, key, def string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return def
+}
+
+func splitComma(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func splitCommaOrDefault(s string, def []string) []string {
+	if s == "" {
+		return def
+	}
+	return splitComma(s)
+}
+
+func splitMethodPass(userInfo string) (string, string) {
+	colon := strings.Index(userInfo, ":")
+	if colon < 0 {
+		return "2022-blake3-aes-128-gcm", userInfo
+	}
+	return userInfo[:colon], userInfo[colon+1:]
+}
+
+func padBase64(s string) string {
+	for len(s)%4 != 0 {
+		s += "="
+	}
+	return s
+}
+
+func base64DecodeFlexible(s string) (string, error) {
+	s = padBase64(s)
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return string(b), nil
+	}
+	if b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "=")); err == nil {
+		return string(b), nil
+	}
+	return "", fmt.Errorf("base64 decode failed")
+}

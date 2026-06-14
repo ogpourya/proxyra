@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"h12.io/socks"
+
+	"github.com/ogpourya/proxyra/xray"
 )
 
 const (
@@ -66,6 +68,18 @@ func readProxiesFromFile(path string) ([]string, error) {
 		}
 	}
 	return list, scanner.Err()
+}
+
+func isXrayLink(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.HasPrefix(s, "vless://") ||
+		strings.HasPrefix(s, "vmess://") ||
+		strings.HasPrefix(s, "trojan://") ||
+		strings.HasPrefix(s, "ss://") ||
+		strings.HasPrefix(s, "hysteria2://") ||
+		strings.HasPrefix(s, "hy2://") ||
+		strings.HasPrefix(s, "wireguard://") ||
+		strings.HasPrefix(s, "wg://")
 }
 
 // remove duplicates
@@ -533,6 +547,37 @@ func main() {
 
 	proxies = uniqProxies(proxies)
 
+	// Convert xray links (vless://, vmess://, etc.) to local SOCKS5 proxies via xray
+	var xrayMgr *xray.Manager
+	proxyMap := make(map[string]string) // localSocks5Addr -> originalXrayLink
+	for i, p := range proxies {
+		if isXrayLink(p) {
+			if xrayMgr == nil {
+				xrayMgr = xray.NewManager()
+			}
+			ob, err := xray.ParseLink(p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing xray link: %v\n", err)
+				continue
+			}
+			inst, err := xrayMgr.AddOutbound(ob)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error adding xray outbound: %v\n", err)
+				continue
+			}
+			localAddr := fmt.Sprintf("socks5://127.0.0.1:%d", inst.Port)
+			proxyMap[localAddr] = p
+			proxies[i] = localAddr
+		}
+	}
+	if xrayMgr != nil {
+		if err := xrayMgr.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting xray: %v\n", err)
+			os.Exit(1)
+		}
+		defer xrayMgr.StopAll()
+	}
+
 	// Use smaller buffer to avoid excessive memory with large proxy lists
 	bufferSize := 100
 	if len(proxies) < bufferSize {
@@ -578,6 +623,10 @@ func main() {
 	}()
 
 	for ok := range out {
-		_, _ = os.Stdout.WriteString(ok + "\n")
+		if orig, found := proxyMap[ok]; found {
+			_, _ = os.Stdout.WriteString(orig + "\n")
+		} else {
+			_, _ = os.Stdout.WriteString(ok + "\n")
+		}
 	}
 }
