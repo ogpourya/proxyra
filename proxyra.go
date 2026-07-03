@@ -547,7 +547,7 @@ func main() {
 
 	proxies = uniqProxies(proxies)
 
-	// Convert xray links (vless://, vmess://, etc.) to local SOCKS5 proxies via xray
+	// Convert xray config links (vless://, vmess://, etc.) to local SOCKS5 proxies via xray
 	var xrayMgr *xray.Manager
 	proxyMap := make(map[string]string) // localSocks5Addr -> originalXrayLink
 	for i, p := range proxies {
@@ -557,7 +557,7 @@ func main() {
 			}
 			ob, err := xray.ParseLink(p)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing xray link: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error parsing xray config link: %v\n", err)
 				continue
 			}
 			inst, err := xrayMgr.AddOutbound(ob)

@@ -1,5 +1,5 @@
 # proxyra
-Fast, minimal, and reliable proxy checker with automatic multi-source IP validation and native Xray subscription support.
+Fast, minimal, and reliable proxy checker with automatic multi-source IP validation and native Xray config link support.
 
 ## Features
 - **Smart Mode** — Automatic anonymity & functionality check via multi-source IP matching.
@@ -19,8 +19,13 @@ If `-u` is omitted, **proxyra** validates proxies by sequentially checking their
 
 A proxy passes if its IP matches in response from any of these services.
 
-## Xray Links
+## Xray Config Links
 When a proxy entry starts with `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, `hy2://`, `wireguard://`, or `wg://`, proxyra automatically parses the link, starts a local xray instance, and validates it as a `socks5://127.0.0.1:<port>` outbound. The original link is printed on success.
+
+Only **individual xray config links** (one per line) are supported. If you have a subscription endpoint URL, fetch and decode it first:
+```bash
+curl -sL "<subscription-url>" | base64 -d | proxyra
+```
 
 The xray binary must be installed and available in `$PATH` (or at `/usr/local/bin/xray` / `/usr/bin/xray`).
 
@@ -44,7 +49,7 @@ The xray binary must be installed and available in `$PATH` (or at `/usr/local/bi
 go install github.com/ogpourya/proxyra@latest
 ```
 
-Proxyra expects the [xray](https://github.com/XTLS/Xray-core) binary in `$PATH` when validating xray subscription links.
+Proxyra expects the [xray](https://github.com/XTLS/Xray-core) binary in `$PATH` when validating xray config links.
 
 ## Examples
 
@@ -72,9 +77,9 @@ proxyra -l list.txt -u http://api.com -H "Auth: secret"
 proxyra -l list.txt -tcp -u 1.1.1.1:53
 ```
 
-### 5. Xray Subscription Links
+### 5. Xray Config Links
 ```bash
-# Mixed list with regular proxies and xray links
+# Mixed list with regular proxies and xray config links
 cat nodes.txt | proxyra -t 3 -c 20 -m 5
 ```
 Where `nodes.txt` contains any combination of `socks5://...`, `http://...`, `vless://...`, `vmess://...`, `trojan://...`, `ss://...`, `hysteria2://...`, etc.
