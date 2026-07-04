@@ -174,19 +174,11 @@ func parseVless(link string) (*XrayOutbound, error) {
 		Protocol: "vless",
 		Tag:      decodeHash(u.Fragment),
 		Settings: map[string]any{
-			"vnext": []any{
-				map[string]any{
-					"address": host,
-					"port":    port,
-					"users": []any{
-						map[string]any{
-							"id":         id,
-							"flow":       params.Get("flow"),
-							"encryption": firstNonEmpty(params.Get("encryption"), "none"),
-						},
-					},
-				},
-			},
+			"address":    host,
+			"port":       port,
+			"id":         id,
+			"flow":       params.Get("flow"),
+			"encryption": firstNonEmpty(params.Get("encryption"), "none"),
 		},
 		StreamSettings: stream,
 	}

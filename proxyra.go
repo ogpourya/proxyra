@@ -124,9 +124,11 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 	case "http", "https":
 		transport.Proxy = http.ProxyURL(u)
 
-	case "socks4", "socks4a", "socks5":
+	case "socks4", "socks4a", "socks5", "socks5h":
 		// h12.io/socks returns a dial func of signature func(network, addr string) (net.Conn, error)
-		dialSocks := socks.Dial(proxyAddr)
+		// Normalize socks5h -> socks5 (the h12 library doesn't support the h suffix, but
+		// the library already passes hostnames through as-is when given a hostname:port addr).
+		dialSocks := socks.Dial(strings.Replace(proxyAddr, "socks5h://", "socks5://", 1))
 
 		// Wrap the returned dial function to honor context and avoid leaks.
 		// We also use the caller context deadline, which in your code is set by NewRequestWithContext.
@@ -201,8 +203,8 @@ func checkProxyTCP(proxyAddr, target string, timeout float64) bool {
 	timeoutDuration := time.Duration(timeout * float64(time.Second))
 
 	switch u.Scheme {
-	case "socks4", "socks4a", "socks5":
-		dialSocks := socks.Dial(proxyAddr)
+	case "socks4", "socks4a", "socks5", "socks5h":
+		dialSocks := socks.Dial(strings.Replace(proxyAddr, "socks5h://", "socks5://", 1))
 		ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 		defer cancel()
 
@@ -294,7 +296,7 @@ func isPrivateIP(ipStr string) bool {
 	if ip == nil {
 		return false
 	}
-	return ip.IsPrivate()
+	return ip.IsPrivate() || ip.IsLoopback()
 }
 
 func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
