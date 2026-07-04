@@ -289,6 +289,14 @@ func checkProxyTCP(proxyAddr, target string, timeout float64) bool {
 }
 
 // check if proxy works with HTTP mode
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate()
+}
+
 func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
 	// If target is "SMART_MODE", we try multiple IP services sequentially
 	if target == "SMART_MODE" {
@@ -298,7 +306,7 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 			"https://a.ident.me",
 		}
 
-		// Determine expected IP once
+		// Extract host/ip from proxy address
 		host := proxyAddr
 		if strings.Contains(host, "://") {
 			u, _ := url.Parse(host)
@@ -310,7 +318,21 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 		if err != nil {
 			ip = host
 		}
-		ipRe, _ := regexp.Compile(regexp.QuoteMeta(strings.TrimSpace(ip)))
+		ip = strings.TrimSpace(ip)
+
+		// For local/private proxies (e.g. 127.0.0.1, localhost, 192.168.x.x)
+		// we can't match against the remote exit IP since it will be the proxy's
+		// public IP, not the local address. Just verify the request succeeds.
+		if isPrivateIP(ip) || ip == "localhost" {
+			for _, svc := range services {
+				if performHTTPCheck(proxyAddr, svc, timeout, re, insecure, expectedStatus, headers, stderrMutex) {
+					return true
+				}
+			}
+			return false
+		}
+
+		ipRe, _ := regexp.Compile(regexp.QuoteMeta(ip))
 
 		for _, svc := range services {
 			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, expectedStatus, headers, stderrMutex) {

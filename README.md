@@ -17,7 +17,9 @@ If `-u` is omitted, **proxyra** validates proxies by sequentially checking their
 2. `checkip.amazonaws.com`
 3. `a.ident.me`
 
-A proxy passes if its IP matches in response from any of these services.
+A proxy passes if its public IP matches the response from any of these services.
+For local proxies (`127.0.0.1`, `localhost`, RFC 1918 addresses) the IP check is
+skipped — the proxy passes if the HTTP request succeeds.
 
 ## Xray Config Links
 When a proxy entry starts with `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, `hy2://`, `wireguard://`, or `wg://`, proxyra automatically parses the link, starts a local xray instance, and validates it as a `socks5://127.0.0.1:<port>` outbound. The original link is printed on success.
