@@ -29,7 +29,7 @@ Only **individual xray config links** (one per line) are supported. If you have 
 curl -sL "<subscription-url>" | base64 -d | proxyra
 ```
 
-The xray binary must be installed and available in `$PATH` (or at `/usr/local/bin/xray` / `/usr/bin/xray`).
+Xray binary and geoip/geosite data are downloaded automatically on first use — no manual installation required.
 
 ## Options
 | Option | Description |
@@ -51,7 +51,7 @@ The xray binary must be installed and available in `$PATH` (or at `/usr/local/bi
 go install github.com/ogpourya/proxyra@latest
 ```
 
-Proxyra expects the [xray](https://github.com/XTLS/Xray-core) binary in `$PATH` when validating xray config links.
+Proxyra auto-downloads [xray](https://github.com/XTLS/Xray-core) and geoip/geosite data from the official repositories on first use if not found in `$PATH` or `~/.local/bin`. SHA256 checksums are verified against the official `.dgst` and `.sha256sum` files. No manual setup needed.
 
 ## Examples
 
