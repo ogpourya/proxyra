@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,7 +97,7 @@ func uniqProxies(proxies []string) []string {
 }
 
 // build transport with full proxy support (http, socks4, socks4a, socks5)
-func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Transport, error) {
+func newTransport(proxyAddr string, timeout float64, insecure bool, noDNS bool) (http.RoundTripper, error) {
 	// accept scheme-less proxy like "1.2.3.4:1080" and default to socks5 as common choice
 	if !strings.Contains(proxyAddr, "://") {
 		proxyAddr = "socks5://" + proxyAddr
@@ -105,6 +106,25 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 	u, err := url.Parse(proxyAddr)
 	if err != nil {
 		return nil, err
+	}
+
+	proxyHost := u.Host
+	isSOCKS := false
+	switch u.Scheme {
+	case "socks4", "socks4a", "socks5", "socks5h":
+		isSOCKS = true
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
+	}
+
+	if noDNS {
+		return &noDNSRoundTripper{
+			proxyAddr: proxyHost,
+			isSOCKS:   isSOCKS,
+			timeout:   time.Duration(timeout * float64(time.Second)),
+			insecure:  insecure,
+		}, nil
 	}
 
 	transport := &http.Transport{
@@ -125,16 +145,8 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 		transport.Proxy = http.ProxyURL(u)
 
 	case "socks4", "socks4a", "socks5", "socks5h":
-		// h12.io/socks returns a dial func of signature func(network, addr string) (net.Conn, error)
-		// Normalize socks5h -> socks5 (the h12 library doesn't support the h suffix, but
-		// the library already passes hostnames through as-is when given a hostname:port addr).
 		dialSocks := socks.Dial(strings.Replace(proxyAddr, "socks5h://", "socks5://", 1))
-
-		// Wrap the returned dial function to honor context and avoid leaks.
-		// We also use the caller context deadline, which in your code is set by NewRequestWithContext.
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// If caller already has a deadline, prefer that. Otherwise set an internal timeout.
-			// Use the timeout parameter only as a fallback.
 			dctx := ctx
 			var cancel context.CancelFunc
 			if _, ok := ctx.Deadline(); !ok && timeout > 0 {
@@ -148,7 +160,6 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 
 			go func() {
 				conn, err := dialSocks(network, addr)
-				// try to send result; if caller already gave up, close the conn to avoid leak
 				select {
 				case ch <- struct {
 					conn net.Conn
@@ -179,12 +190,141 @@ func newTransport(proxyAddr string, timeout float64, insecure bool) (*http.Trans
 				return r.conn, r.err
 			}
 		}
-
-	default:
-		return nil, fmt.Errorf("unsupported proxy scheme: %s", u.Scheme)
 	}
 
 	return transport, nil
+}
+
+// noDNSRoundTripper sends requests through a proxy without resolving DNS locally.
+// SOCKS5 uses ATYP 0x03 (domain); HTTP CONNECT sends the hostname as-is.
+type noDNSRoundTripper struct {
+	proxyAddr string
+	isSOCKS   bool
+	timeout   time.Duration
+	insecure  bool
+}
+
+func (rt *noDNSRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	target := req.URL.Host
+	if req.URL.Port() == "" {
+		if req.URL.Scheme == "https" {
+			target = net.JoinHostPort(req.URL.Host, "443")
+		} else {
+			target = net.JoinHostPort(req.URL.Host, "80")
+		}
+	}
+
+	conn, err := net.DialTimeout("tcp", rt.proxyAddr, rt.timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if rt.isSOCKS {
+		if err := rt.socks5Handshake(conn, target); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := rt.httpConnect(conn, target); err != nil {
+			return nil, err
+		}
+	}
+
+	var tunnel net.Conn = conn
+	if req.URL.Scheme == "https" {
+		tlsConn := tls.Client(tunnel, &tls.Config{
+			ServerName:         req.URL.Hostname(),
+			InsecureSkipVerify: rt.insecure,
+			MinVersion:         tls.VersionTLS12,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, err
+		}
+		tunnel = tlsConn
+	}
+
+	if err := req.Write(tunnel); err != nil {
+		return nil, err
+	}
+	return http.ReadResponse(bufio.NewReader(tunnel), req)
+}
+
+func (rt *noDNSRoundTripper) CloseIdleConnections() {}
+
+func (rt *noDNSRoundTripper) socks5Handshake(conn net.Conn, target string) error {
+	conn.SetDeadline(time.Now().Add(rt.timeout))
+	defer conn.SetDeadline(time.Time{})
+
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return err
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		return fmt.Errorf("socks5 auth not supported")
+	}
+
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return err
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+	req = append(req, []byte(host)...)
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+
+	resp = make([]byte, 4)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return err
+	}
+	if resp[1] != 0x00 {
+		return fmt.Errorf("socks5 connect failed: %d", resp[1])
+	}
+
+	switch resp[3] {
+	case 0x01:
+		io.ReadFull(conn, make([]byte, 6))
+	case 0x03:
+		l := make([]byte, 1)
+		io.ReadFull(conn, l)
+		io.ReadFull(conn, make([]byte, int(l[0])+2))
+	case 0x04:
+		io.ReadFull(conn, make([]byte, 18))
+	}
+	return nil
+}
+
+func (rt *noDNSRoundTripper) httpConnect(conn net.Conn, target string) error {
+	conn.SetDeadline(time.Now().Add(rt.timeout))
+	defer conn.SetDeadline(time.Time{})
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		return err
+	}
+
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(line, " 200 ") {
+		return fmt.Errorf("CONNECT failed: %s", strings.TrimSpace(line))
+	}
+	for {
+		line, err = br.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	return nil
 }
 
 // check if proxy works with TCP mode
@@ -299,8 +439,7 @@ func isPrivateIP(ipStr string) bool {
 	return ip.IsPrivate() || ip.IsLoopback()
 }
 
-func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
-	// If target is "SMART_MODE", we try multiple IP services sequentially
+func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
 	if target == "SMART_MODE" {
 		services := []string{
 			"http://icanhazip.com",
@@ -308,7 +447,6 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 			"https://a.ident.me",
 		}
 
-		// Extract host/ip from proxy address
 		host := proxyAddr
 		if strings.Contains(host, "://") {
 			u, _ := url.Parse(host)
@@ -322,12 +460,9 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 		}
 		ip = strings.TrimSpace(ip)
 
-		// For local/private proxies (e.g. 127.0.0.1, localhost, 192.168.x.x)
-		// we can't match against the remote exit IP since it will be the proxy's
-		// public IP, not the local address. Just verify the request succeeds.
 		if isPrivateIP(ip) || ip == "localhost" {
 			for _, svc := range services {
-				if performHTTPCheck(proxyAddr, svc, timeout, re, insecure, expectedStatus, headers, stderrMutex) {
+				if performHTTPCheck(proxyAddr, svc, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex) {
 					return true
 				}
 			}
@@ -337,22 +472,22 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 		ipRe, _ := regexp.Compile(regexp.QuoteMeta(ip))
 
 		for _, svc := range services {
-			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, expectedStatus, headers, stderrMutex) {
+			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, noDNS, expectedStatus, headers, stderrMutex) {
 				return true
 			}
 		}
 		return false
 	}
 
-	return performHTTPCheck(proxyAddr, target, timeout, re, insecure, expectedStatus, headers, stderrMutex)
+	return performHTTPCheck(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex)
 }
 
-func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
+func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
 	timeoutDuration := time.Duration(timeout * float64(time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
 
-	transport, err := newTransport(proxyAddr, timeout, insecure)
+	transport, err := newTransport(proxyAddr, timeout, insecure, noDNS)
 	if err != nil {
 		return false
 	}
@@ -410,16 +545,15 @@ func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Rege
 	fullResponse.Write(headerDump)
 	fullResponse.Write(buf.Bytes())
 
-	transport.CloseIdleConnections()
+	_ = transport
 
 	return re.Match(fullResponse.Bytes())
 }
 
 // worker
-func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup, insecure bool, checkCount int, tcpMode bool, expectedStatus int, headers []string, maxFound *int, maxMutex *sync.Mutex, done chan struct{}, stderrMutex *sync.Mutex) {
+func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup, insecure bool, noDNS bool, checkCount int, tcpMode bool, expectedStatus int, headers []string, maxFound *int, maxMutex *sync.Mutex, done chan struct{}, stderrMutex *sync.Mutex) {
 	defer wg.Done()
 	for proxyAddr := range jobs {
-		// Check if we should stop early
 		select {
 		case <-done:
 			return
@@ -432,12 +566,11 @@ func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regex
 			if tcpMode {
 				success = checkProxyTCP(proxyAddr, target, timeout)
 			} else {
-				success = checkProxyHTTP(proxyAddr, target, timeout, re, insecure, expectedStatus, headers, stderrMutex)
+				success = checkProxyHTTP(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex)
 			}
 			if success {
 				passed++
 			} else if checkCount > 1 {
-				// Early exit: if we need all checks to pass and one failed, no point continuing
 				break
 			}
 		}
@@ -483,6 +616,7 @@ func main() {
 	listFile := flag.String("l", "", "File with list of proxies")
 	regexStr := flag.String("r", "", "Regex to match response (headers or body)")
 	insecure := flag.Bool("k", false, "Allow insecure TLS connections (disabled by default)")
+	noDNS := flag.Bool("no-dns", true, "Skip local DNS resolution; pass hostnames as-is to upstream proxies")
 	checkCount := flag.Int("n", 1, "Number of times a proxy must pass checks to be valid")
 	tcpMode := flag.Bool("tcp", false, "TCP connection mode (test raw TCP connection instead of HTTP)")
 	maxFound := flag.Int("m", 0, "Stop after finding N valid proxies (0 = unlimited)")
@@ -626,7 +760,7 @@ func main() {
 	}
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go worker(jobs, *target, *timeout, re, out, &wg, *insecure, *checkCount, *tcpMode, *expectedStatus, headers, maxFoundPtr, &maxMutex, done, &stderrMutex)
+		go worker(jobs, *target, *timeout, re, out, &wg, *insecure, *noDNS, *checkCount, *tcpMode, *expectedStatus, headers, maxFoundPtr, &maxMutex, done, &stderrMutex)
 	}
 
 	// Feed jobs to workers

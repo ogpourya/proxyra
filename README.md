@@ -44,6 +44,7 @@ Xray binary and geoip/geosite data are downloaded automatically on first use —
 | `-m` | Stop after finding N valid proxies (`0` = unlimited) |
 | `-H` | Custom request header, repeatable (`-H "Key: Value"`) |
 | `-k` | Allow insecure TLS connections (default: `false`) |
+| `-no-dns` | Skip local DNS; pass hostnames as-is to upstream proxies (default: `true`) |
 | `-tcp`| Enable raw TCP connection mode |
 
 ## Installation
