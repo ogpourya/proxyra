@@ -3,7 +3,7 @@ Fast, minimal, and reliable proxy checker with automatic multi-source IP validat
 
 ## Features
 - **Smart Mode** — Automatic anonymity & functionality check via multi-source IP matching.
-- **Protocol Support** — HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, SOCKS5h.
+- **Protocol Support** — HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, SOCKS5h. With `-no-dns` (default), hostnames are sent as-is to upstream proxies; `socks5h` is equivalent to `socks5`.
 - **Xray Integration** — Auto-detect and parse VLESS, VMess, Trojan, Shadowsocks, Hysteria2, and WireGuard links; spins up local xray instances as SOCKS5 proxies for validation.
 - **TCP Mode** — Raw connection testing for non-HTTP targets (CONNECT for HTTP proxies, direct dial for SOCKS proxies).
 - **Validation** — Regex matching on full response (Headers + Body) and Status Code checks.
