@@ -49,7 +49,7 @@ Xray binary and geoip/geosite data are downloaded automatically on first use —
 
 ## Installation
 ```bash
-go install github.com/ogpourya/proxyra@latest
+GOPROXY=direct go install github.com/ogpourya/proxyra@latest
 ```
 
 Proxyra auto-downloads [xray](https://github.com/XTLS/Xray-core) and geoip/geosite data from the official repositories on first use if not found in `$PATH` or `~/.local/bin`. SHA256 checksums are verified against the official `.dgst` and `.sha256sum` files. No manual setup needed.
