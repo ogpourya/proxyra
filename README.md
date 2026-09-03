@@ -47,6 +47,7 @@ Xray binary and geoip/geosite data are downloaded automatically on first use —
 | `-no-dns` | Skip local DNS; pass hostnames as-is to upstream proxies (default: `true`) |
 | `-tcp`| Enable raw TCP connection mode |
 | `-v` | Verbose logging (xray warnings) |
+| `-j` | JS matcher: file path or inline code defining `function match(url, body, status, headers)` (body = first 1MB, headers = `Name: value` lines; truthy return passes) |
 
 ## Installation
 ```bash
@@ -85,6 +86,13 @@ proxyra -l list.txt -tcp -u 1.1.1.1:53
 ```bash
 # Mixed list with regular proxies and xray config links
 cat nodes.txt | proxyra -t 3 -c 20 -m 5
+```
+
+### 6. JS Matcher
+```bash
+# File or inline JS, same shape as urlgrep's match()
+proxyra -l list.txt -u https://target.com -j match.js
+proxyra -l list.txt -u https://target.com -j 'function match(u,b,s,h){return b.includes("admin")}'
 ```
 Where `nodes.txt` contains any combination of `socks5://...`, `http://...`, `vless://...`, `vmess://...`, `trojan://...`, `ss://...`, `hysteria2://...`, etc.
 

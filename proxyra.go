@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -439,7 +440,7 @@ func isPrivateIP(ipStr string) bool {
 	return ip.IsPrivate() || ip.IsLoopback()
 }
 
-func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
+func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex, js *jsRunner) bool {
 	if target == "SMART_MODE" {
 		services := []string{
 			"http://icanhazip.com",
@@ -462,7 +463,7 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 
 		if isPrivateIP(ip) || ip == "localhost" {
 			for _, svc := range services {
-				if performHTTPCheck(proxyAddr, svc, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex) {
+				if performHTTPCheck(proxyAddr, svc, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex, js) {
 					return true
 				}
 			}
@@ -472,17 +473,17 @@ func checkProxyHTTP(proxyAddr, target string, timeout float64, re *regexp.Regexp
 		ipRe, _ := regexp.Compile(regexp.QuoteMeta(ip))
 
 		for _, svc := range services {
-			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, noDNS, expectedStatus, headers, stderrMutex) {
+			if performHTTPCheck(proxyAddr, svc, timeout, ipRe, insecure, noDNS, expectedStatus, headers, stderrMutex, js) {
 				return true
 			}
 		}
 		return false
 	}
 
-	return performHTTPCheck(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex)
+	return performHTTPCheck(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex, js)
 }
 
-func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex) bool {
+func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Regexp, insecure bool, noDNS bool, expectedStatus int, headers []string, stderrMutex *sync.Mutex, js *jsRunner) bool {
 	timeoutDuration := time.Duration(timeout * float64(time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
@@ -531,9 +532,13 @@ func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Rege
 		return false
 	}
 
-	// Read body up to limit
+	// Read body up to limit (1MB for JS matcher, 64KB otherwise)
+	limit := readLimitBytes
+	if js != nil {
+		limit = 1 << 20
+	}
 	var buf bytes.Buffer
-	_, _ = io.CopyN(&buf, resp.Body, int64(readLimitBytes))
+	_, _ = io.CopyN(&buf, resp.Body, int64(limit))
 
 	// Dump headers (false = do not dump body yet)
 	headerDump, err := httputil.DumpResponse(resp, false)
@@ -547,12 +552,40 @@ func performHTTPCheck(proxyAddr, target string, timeout float64, re *regexp.Rege
 
 	_ = transport
 
-	return re.Match(fullResponse.Bytes())
+	if !re.Match(fullResponse.Bytes()) {
+		return false
+	}
+	if js == nil {
+		return true
+	}
+
+	keys := make([]string, 0, len(resp.Header))
+	for k := range resp.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var hb strings.Builder
+	for _, k := range keys {
+		for _, v := range resp.Header[k] {
+			hb.WriteString(k)
+			hb.WriteString(": ")
+			hb.WriteString(v)
+			hb.WriteString("\n")
+		}
+	}
+	return js.match(target, buf.String(), resp.StatusCode, hb.String())
 }
 
 // worker
-func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup, insecure bool, noDNS bool, checkCount int, tcpMode bool, expectedStatus int, headers []string, maxFound *int, maxMutex *sync.Mutex, done chan struct{}, stderrMutex *sync.Mutex) {
+func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regexp, out chan<- string, wg *sync.WaitGroup, insecure bool, noDNS bool, checkCount int, tcpMode bool, expectedStatus int, headers []string, maxFound *int, maxMutex *sync.Mutex, done chan struct{}, stderrMutex *sync.Mutex, jsm *jsMatcher) {
 	defer wg.Done()
+	var js *jsRunner
+	if jsm != nil {
+		var err error
+		if js, err = jsm.newRunner(); err != nil {
+			return
+		}
+	}
 	for proxyAddr := range jobs {
 		select {
 		case <-done:
@@ -566,7 +599,7 @@ func worker(jobs <-chan string, target string, timeout float64, re *regexp.Regex
 			if tcpMode {
 				success = checkProxyTCP(proxyAddr, target, timeout)
 			} else {
-				success = checkProxyHTTP(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex)
+				success = checkProxyHTTP(proxyAddr, target, timeout, re, insecure, noDNS, expectedStatus, headers, stderrMutex, js)
 			}
 			if success {
 				passed++
@@ -621,6 +654,7 @@ func main() {
 	tcpMode := flag.Bool("tcp", false, "TCP connection mode (test raw TCP connection instead of HTTP)")
 	maxFound := flag.Int("m", 0, "Stop after finding N valid proxies (0 = unlimited)")
 	verbose := flag.Bool("v", false, "Verbose logging")
+	jsArg := flag.String("j", "", "JS matcher: file path or inline code defining function match(url, body, status, headers)")
 	expectedStatus := flag.Int("s", 0, "Expected HTTP status code (0 = any status)")
 	var headers headerFlags
 	flag.Var(&headers, "H", "Custom request header (can be used multiple times, e.g. -H \"User-Agent: custom\")")
@@ -683,6 +717,15 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error: invalid regex:", err)
 		os.Exit(1)
+	}
+
+	var jsm *jsMatcher
+	if *jsArg != "" {
+		jsm, err = loadJSMatcher(*jsArg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: invalid JS matcher:", err)
+			os.Exit(1)
+		}
 	}
 
 	proxies, err := readProxiesFromStdin()
@@ -780,7 +823,7 @@ func main() {
 	}
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go worker(jobs, *target, *timeout, re, out, &wg, *insecure, *noDNS, *checkCount, *tcpMode, *expectedStatus, headers, maxFoundPtr, &maxMutex, done, &stderrMutex)
+		go worker(jobs, *target, *timeout, re, out, &wg, *insecure, *noDNS, *checkCount, *tcpMode, *expectedStatus, headers, maxFoundPtr, &maxMutex, done, &stderrMutex, jsm)
 	}
 
 	// Feed jobs to workers
