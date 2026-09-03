@@ -33,11 +33,13 @@ type entry struct {
 type Manager struct {
 	mu      sync.Mutex
 	binPath string
-	tmpDir  string
 	entries []*entry
-	cmd     *exec.Cmd
-	done    chan struct{}
+	cmds    []*exec.Cmd
+	tmpDirs []string
+	dones   []chan struct{}
 }
+
+// ponytail: fixed 100 inbounds per xray process; raise if xray handles bigger single configs reliably
 
 func NewManager() *Manager {
 	return &Manager{}
@@ -212,7 +214,7 @@ func httpDownloadFile(url, dest string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("http %s", resp.StatusCode)
+		return fmt.Errorf("http %d", resp.StatusCode)
 	}
 	f, err := os.Create(dest)
 	if err != nil {
@@ -301,7 +303,13 @@ func detectArch() (string, error) {
 }
 
 func (m *Manager) AddOutbound(ob *XrayOutbound) (*Instance, error) {
-	port, err := findFreePort()
+	m.mu.Lock()
+	used := make(map[int]struct{}, len(m.entries))
+	for _, e := range m.entries {
+		used[e.port] = struct{}{}
+	}
+	m.mu.Unlock()
+	port, err := findFreePort(used)
 	if err != nil {
 		return nil, err
 	}
@@ -330,15 +338,51 @@ func (m *Manager) Start() error {
 		return err
 	}
 
+	const batchSize = 100
+	var firstErr error
+	started := 0
+	for i := 0; i < len(entries); i += batchSize {
+		batch := entries[i:min(i+batchSize, len(entries))]
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				m.reassignPorts(batch)
+			}
+			if err = m.startBatch(bin, batch); err == nil {
+				break
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: xray batch %d-%d failed: %v\n", i, i+len(batch), err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		started++
+	}
+	if started == 0 {
+		return firstErr
+	}
+	return nil
+}
+
+func (m *Manager) startBatch(bin string, batch []*entry) error {
+	// One bad link (e.g. fragment mask xray rejects) kills the whole batch
+	// config, so quarantine poisons via `xray -test` before starting.
+	batch = m.quarantine(bin, batch)
+	if len(batch) == 0 {
+		return fmt.Errorf("all outbounds in batch failed validation")
+	}
 	tmpDir, err := os.MkdirTemp("", "proxyra-xray-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	configPath := filepath.Join(tmpDir, "config.json")
 
-	config := buildConfig(entries)
+	config := buildConfig(batch)
 
-	configJSON, err := json.MarshalIndent(config, "", "  ")
+	configJSON, err := json.Marshal(config)
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		return fmt.Errorf("marshal config: %w", err)
@@ -351,7 +395,7 @@ func (m *Manager) Start() error {
 	stderr := new(strings.Builder)
 	done := make(chan struct{})
 	cmd := exec.Command(bin, "-c", configPath)
-	cmd.Stdout = nil
+	cmd.Stdout = stderr // ponytail: xray prints fatal errors to stdout, not stderr
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
@@ -364,8 +408,8 @@ func (m *Manager) Start() error {
 		close(done)
 	}()
 
-	ports := make([]int, len(entries))
-	for i, e := range entries {
+	ports := make([]int, len(batch))
+	for i, e := range batch {
 		ports[i] = e.port
 	}
 	if err := waitForPorts(ports, done, 30*time.Second); err != nil {
@@ -379,9 +423,9 @@ func (m *Manager) Start() error {
 	}
 
 	m.mu.Lock()
-	m.tmpDir = tmpDir
-	m.cmd = cmd
-	m.done = done
+	m.tmpDirs = append(m.tmpDirs, tmpDir)
+	m.cmds = append(m.cmds, cmd)
+	m.dones = append(m.dones, done)
 	m.mu.Unlock()
 
 	return nil
@@ -399,19 +443,24 @@ func (m *Manager) Instances() []*Instance {
 
 func (m *Manager) StopAll() {
 	m.mu.Lock()
-	cmd := m.cmd
-	done := m.done
-	tmpDir := m.tmpDir
+	cmds := m.cmds
+	dones := m.dones
+	tmpDirs := m.tmpDirs
+	m.cmds, m.dones, m.tmpDirs = nil, nil, nil
 	m.mu.Unlock()
 
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
+	for _, cmd := range cmds {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
 	}
-	if done != nil {
-		<-done
+	for _, done := range dones {
+		if done != nil {
+			<-done
+		}
 	}
-	if tmpDir != "" {
-		os.RemoveAll(tmpDir)
+	for _, d := range tmpDirs {
+		os.RemoveAll(d)
 	}
 }
 
@@ -453,7 +502,7 @@ func buildConfig(entries []*entry) map[string]any {
 
 	return map[string]any{
 		"log": map[string]any{
-			"loglevel": "none",
+			"loglevel": "warning", // ponytail: stderr captured, shown only if the batch fails to start
 		},
 		"dns": map[string]any{
 			"servers": []any{
@@ -486,12 +535,18 @@ func configToRaw(ob *XrayOutbound, tag string) map[string]any {
 	return raw
 }
 
-func findFreePort() (int, error) {
-	for i := 0; i < 10; i++ {
-		port := 30000 + rand.N(20000)
+// ponytail: ports picked below the ephemeral range (usually 32768-60999),
+// so outbound probe connections can never squat on a future xray listen port (EADDRINUSE -> xray exits)
+func findFreePort(used map[int]struct{}) (int, error) {
+	for i := 0; i < 50; i++ {
+		port := 10000 + rand.N(20000) // 10000-29999
+		if _, ok := used[port]; ok {
+			continue
+		}
 		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
 		if err == nil {
 			ln.Close()
+			used[port] = struct{}{}
 			return port, nil
 		}
 	}
@@ -504,6 +559,55 @@ func findFreePort() (int, error) {
 	return port, nil
 }
 
+// quarantine drops entries xray refuses to load, bisecting to isolate poisons.
+func (m *Manager) quarantine(bin string, batch []*entry) []*entry {
+	if err := testConfig(bin, batch); err == nil {
+		return batch
+	}
+	if len(batch) == 1 {
+		fmt.Fprintf(os.Stderr, "Warning: dropping invalid xray config (tag %q)\n", batch[0].tag)
+		return nil
+	}
+	mid := len(batch) / 2
+	out := m.quarantine(bin, batch[:mid])
+	return append(out, m.quarantine(bin, batch[mid:])...)
+}
+
+func testConfig(bin string, batch []*entry) error {
+	dir, err := os.MkdirTemp("", "proxyra-xray-test-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "config.json")
+	b, err := json.Marshal(buildConfig(batch))
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, b, 0644); err != nil {
+		return err
+	}
+	if out, err := exec.Command(bin, "-test", "-c", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (m *Manager) reassignPorts(batch []*entry) {
+	m.mu.Lock()
+	used := make(map[int]struct{}, len(m.entries))
+	for _, e := range m.entries {
+		used[e.port] = struct{}{}
+	}
+	for _, e := range batch {
+		delete(used, e.port)
+		if p, err := findFreePort(used); err == nil {
+			e.port = p
+		}
+	}
+	m.mu.Unlock()
+}
+
 func waitForPorts(ports []int, done <-chan struct{}, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	remaining := make(map[int]struct{})
@@ -511,6 +615,7 @@ func waitForPorts(ports []int, done <-chan struct{}, timeout time.Duration) erro
 		remaining[p] = struct{}{}
 	}
 	var mu sync.Mutex
+	sem := make(chan struct{}, 50) // ponytail: cap concurrent dials; unbounded x N ports = thundering herd
 	for len(remaining) > 0 {
 		select {
 		case <-done:
@@ -518,11 +623,7 @@ func waitForPorts(ports []int, done <-chan struct{}, timeout time.Duration) erro
 		default:
 		}
 		if time.Now().After(deadline) {
-			var unready []int
-			for p := range remaining {
-				unready = append(unready, p)
-			}
-			return fmt.Errorf("timeout waiting for ports: %v", unready)
+			return fmt.Errorf("timeout waiting for %d xray ports", len(remaining))
 		}
 
 		mu.Lock()
@@ -535,8 +636,10 @@ func waitForPorts(ports []int, done <-chan struct{}, timeout time.Duration) erro
 		var wg sync.WaitGroup
 		for _, port := range check {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(port int) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 100*time.Millisecond)
 				if err == nil {
 					conn.Close()
@@ -547,8 +650,11 @@ func waitForPorts(ports []int, done <-chan struct{}, timeout time.Duration) erro
 			}(port)
 		}
 		wg.Wait()
-		if len(remaining) > 0 {
-			time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		n := len(remaining)
+		mu.Unlock()
+		if n > 0 {
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	return nil
