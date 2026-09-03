@@ -33,7 +33,9 @@ type entry struct {
 type Manager struct {
 	mu      sync.Mutex
 	binPath string
+	Verbose bool // ponytail: warnings only with -v; quiet by default
 	entries []*entry
+	live    []*entry // entries whose xray process actually started
 	cmds    []*exec.Cmd
 	tmpDirs []string
 	dones   []chan struct{}
@@ -353,7 +355,9 @@ func (m *Manager) Start() error {
 			}
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: xray batch %d-%d failed: %v\n", i, i+len(batch), err)
+			if m.Verbose {
+				fmt.Fprintf(os.Stderr, "Warning: xray batch %d-%d failed: %v\n", i, i+len(batch), err)
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -426,6 +430,7 @@ func (m *Manager) startBatch(bin string, batch []*entry) error {
 	m.tmpDirs = append(m.tmpDirs, tmpDir)
 	m.cmds = append(m.cmds, cmd)
 	m.dones = append(m.dones, done)
+	m.live = append(m.live, batch...)
 	m.mu.Unlock()
 
 	return nil
@@ -434,8 +439,8 @@ func (m *Manager) startBatch(bin string, batch []*entry) error {
 func (m *Manager) Instances() []*Instance {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]*Instance, len(m.entries))
-	for i, e := range m.entries {
+	out := make([]*Instance, len(m.live))
+	for i, e := range m.live {
 		out[i] = &Instance{Port: e.port, Tag: e.tag}
 	}
 	return out
@@ -565,7 +570,9 @@ func (m *Manager) quarantine(bin string, batch []*entry) []*entry {
 		return batch
 	}
 	if len(batch) == 1 {
-		fmt.Fprintf(os.Stderr, "Warning: dropping invalid xray config (tag %q)\n", batch[0].tag)
+		if m.Verbose {
+			fmt.Fprintf(os.Stderr, "Warning: dropping invalid xray config (tag %q)\n", batch[0].tag)
+		}
 		return nil
 	}
 	mid := len(batch) / 2

@@ -620,6 +620,7 @@ func main() {
 	checkCount := flag.Int("n", 1, "Number of times a proxy must pass checks to be valid")
 	tcpMode := flag.Bool("tcp", false, "TCP connection mode (test raw TCP connection instead of HTTP)")
 	maxFound := flag.Int("m", 0, "Stop after finding N valid proxies (0 = unlimited)")
+	verbose := flag.Bool("v", false, "Verbose logging")
 	expectedStatus := flag.Int("s", 0, "Expected HTTP status code (0 = any status)")
 	var headers headerFlags
 	flag.Var(&headers, "H", "Custom request header (can be used multiple times, e.g. -H \"User-Agent: custom\")")
@@ -712,6 +713,7 @@ func main() {
 		if isXrayLink(p) {
 			if xrayMgr == nil {
 				xrayMgr = xray.NewManager()
+				xrayMgr.Verbose = *verbose
 			}
 			ob, err := xray.ParseLink(p)
 			if err != nil {
@@ -734,6 +736,24 @@ func main() {
 			os.Exit(1)
 		}
 		defer xrayMgr.StopAll()
+		// Drop quarantined links (no xray instance): nothing listens on their ports.
+		livePorts := make(map[string]struct{})
+		for _, inst := range xrayMgr.Instances() {
+			livePorts[fmt.Sprintf("socks5://127.0.0.1:%d", inst.Port)] = struct{}{}
+		}
+		kept := proxies[:0]
+		for _, p := range proxies {
+			if _, isXray := proxyMap[p]; !isXray {
+				kept = append(kept, p)
+				continue
+			}
+			if _, ok := livePorts[p]; ok {
+				kept = append(kept, p)
+			} else {
+				delete(proxyMap, p)
+			}
+		}
+		proxies = kept
 	}
 
 	// Use smaller buffer to avoid excessive memory with large proxy lists

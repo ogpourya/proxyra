@@ -46,6 +46,7 @@ Xray binary and geoip/geosite data are downloaded automatically on first use —
 | `-k` | Allow insecure TLS connections (default: `false`) |
 | `-no-dns` | Skip local DNS; pass hostnames as-is to upstream proxies (default: `true`) |
 | `-tcp`| Enable raw TCP connection mode |
+| `-v` | Verbose logging (xray warnings) |
 
 ## Installation
 ```bash
